@@ -1,0 +1,160 @@
+name: Main Rank
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'participants/**'
+
+permissions:
+  contents: write
+
+jobs:
+  rank:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install bench (Playwright)
+        working-directory: bench
+        run: |
+          npm install
+          npx playwright install chromium --with-deps
+
+      - name: Bench all teams
+        run: |
+          mkdir -p results
+          for TEAM_DIR in participants/*/; do
+            TEAM=$(basename "$TEAM_DIR")
+            [ ! -f "$TEAM_DIR/package.json" ] && continue
+
+            echo ""
+            echo "======================================="
+            echo "  Benchmarking: $TEAM"
+            echo "======================================="
+
+            cd "$TEAM_DIR"
+            rm -f data.db data.db-*
+
+            if ! npm install 2>&1; then
+              echo "{\"team\":\"$TEAM\",\"summary\":{\"pass\":0,\"fail\":1,\"total\":1},\"rules\":[],\"frontend\":[],\"stress\":[],\"error\":\"npm install failed\"}" > "../../results/$TEAM.json"
+              cd ../..
+              continue
+            fi
+
+            if ! npm run build 2>&1; then
+              echo "{\"team\":\"$TEAM\",\"summary\":{\"pass\":0,\"fail\":1,\"total\":1},\"rules\":[],\"frontend\":[],\"stress\":[],\"error\":\"npm run build failed\"}" > "../../results/$TEAM.json"
+              cd ../..
+              continue
+            fi
+
+            npm start &
+            SERVER_PID=$!
+            cd ../..
+
+            READY=false
+            for i in $(seq 1 30); do
+              curl -sf http://localhost:3000/api/health > /dev/null 2>&1 && READY=true && break
+              sleep 1
+            done
+
+            if [ "$READY" = false ]; then
+              echo "{\"team\":\"$TEAM\",\"summary\":{\"pass\":0,\"fail\":1,\"total\":1},\"rules\":[],\"frontend\":[],\"stress\":[],\"error\":\"server timeout\"}" > "results/$TEAM.json"
+              kill $SERVER_PID 2>/dev/null
+              continue
+            fi
+
+            node bench/run.js || true
+            cp bench/results.json "results/$TEAM.json" 2>/dev/null || \
+              echo "{\"team\":\"$TEAM\",\"summary\":{\"pass\":0,\"fail\":1,\"total\":1},\"rules\":[],\"frontend\":[],\"stress\":[],\"error\":\"bench crashed\"}" > "results/$TEAM.json"
+
+            # Inject team name
+            node -e "
+              const fs = require('fs');
+              const r = JSON.parse(fs.readFileSync('results/$TEAM.json','utf8'));
+              r.team = '$TEAM';
+              const info = JSON.parse(fs.readFileSync('$TEAM_DIR/info.json','utf8') || '{}');
+              r.info = info;
+              fs.writeFileSync('results/$TEAM.json', JSON.stringify(r, null, 2));
+            " 2>/dev/null || true
+
+            kill $SERVER_PID 2>/dev/null
+            wait $SERVER_PID 2>/dev/null || true
+            sleep 1
+          done
+
+      - name: Generate leaderboard
+        run: |
+          node -e "
+            const fs = require('fs');
+            const files = fs.readdirSync('results').filter(f => f.endsWith('.json'));
+            const teams = files.map(f => JSON.parse(fs.readFileSync('results/' + f, 'utf8')));
+            teams.sort((a, b) => (b.summary?.pass || 0) - (a.summary?.pass || 0));
+            const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
+
+            // LEADERBOARD.md
+            let lb = '# 🏆 Leaderboard -- Rinha FullStack SENAI 2026\n\n';
+            lb += '> Atualizado em: ' + now + ' UTC\n\n';
+            lb += '| # | Time | Testes | Status |\n';
+            lb += '|---|------|--------|--------|\n';
+            teams.forEach((t, i) => {
+              const s = t.summary || {};
+              const icon = t.error ? '❌' : s.fail === 0 ? '✅' : '⚠️';
+              const score = t.error ? '-' : s.pass + '/' + s.total;
+              const status = t.error || (s.fail === 0 ? 'Perfeito' : s.fail + ' falha(s)');
+              lb += '| ' + (i+1) + ' | ' + (t.team||t.info?.team||'?') + ' | ' + score + ' | ' + icon + ' ' + status + ' |\n';
+            });
+            lb += '\n📋 [Resultado completo](./RESULTS.md)\n';
+            fs.writeFileSync('LEADERBOARD.md', lb);
+
+            // RESULTS.md
+            let md = '# 📊 Resultados Completos -- Rinha FullStack SENAI 2026\n\n';
+            md += '> Atualizado em: ' + now + ' UTC  \n';
+            md += '> Total de times: ' + teams.length + '\n\n';
+            md += '| # | Time | Testes | Status |\n';
+            md += '|---|------|--------|--------|\n';
+            teams.forEach((t, i) => {
+              const s = t.summary || {};
+              const score = t.error ? '-' : s.pass + '/' + s.total;
+              md += '| ' + (i+1) + ' | ' + (t.team||'?') + ' | ' + score + ' | ' + (t.error || 'OK') + ' |\n';
+            });
+            md += '\n---\n\n';
+            teams.forEach(t => {
+              const info = t.info || {};
+              const members = (info.members || []).map(m => m.name + ' (' + m.github + ')').join(', ');
+              const s = t.summary || {};
+              md += '<details>\n<summary><strong>' + (t.team||'?') + '</strong> -- ' + (t.error ? '❌ ERRO' : '✅ ' + s.pass + '/' + s.total) + '</summary>\n\n';
+              if (members) md += '**Membros:** ' + members + '\n\n';
+              if (t.error) { md += '**Erro:** ' + t.error + '\n'; }
+              else {
+                ['rules','frontend','stress'].forEach(cat => {
+                  const items = t[cat] || [];
+                  if (items.length === 0) return;
+                  const title = {rules:'Regras de negocio',frontend:'Frontend (Playwright)',stress:'Stress test'}[cat];
+                  md += '**' + title + ':**\n';
+                  items.forEach(i => {
+                    md += '- ' + (i.ok ? '✅' : '❌') + ' ' + i.name;
+                    if (i.detail) md += ' *(' + i.detail + ')*';
+                    md += '\n';
+                  });
+                  md += '\n';
+                });
+              }
+              md += '</details>\n\n';
+            });
+            fs.writeFileSync('RESULTS.md', md);
+            console.log('Leaderboard e resultados gerados');
+          "
+
+      - name: Commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add LEADERBOARD.md RESULTS.md
+          git diff --cached --quiet || git commit -m "chore: atualiza leaderboard e resultados"
+          git push

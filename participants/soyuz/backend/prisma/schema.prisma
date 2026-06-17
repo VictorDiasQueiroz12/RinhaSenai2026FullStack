@@ -21,6 +21,12 @@ model Transaction {
   netAmount          Int      @map("net_amount")
   description        String
   createdAt          DateTime @default(now()) @map("created_at")
+  expiration         String
+  refundedAt         DateTime?
+  idempotencyKey     String? @unique
+  @@index([status])
+  @@index([cardLast4])
+  @@index([createdAt])
 
   @@map("transactions")
 }

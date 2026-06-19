@@ -2,7 +2,7 @@ import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createClient } from '@libsql/client'
 import { PrismaLibSql } from '@prisma/adapter-libsql'
-import { PrismaClient } from '../generated/prisma/client.js'
+import { PrismaClient } from '../generated/prisma/client.ts'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const dbPath = join(__dirname, '../../data.db')
